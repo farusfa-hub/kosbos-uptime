@@ -1,0 +1,85 @@
+name: Uptime KosBos
+
+# Cek /api/health tiap 15 menit dari luar Vercel. Alarm hanya saat status berubah:
+# issue berlabel dibuka saat mati (mention pemilik) dan ditutup saat pulih.
+# Selama issue masih terbuka tidak ada alarm ulang.
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Kosongkan untuk cek produksi. Isi URL lain untuk uji notifikasi (status terpisah, label uptime-uji)."
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: uptime-${{ inputs.url && 'uji' || 'produksi' }}
+  cancel-in-progress: false
+
+jobs:
+  cek:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TARGET: ${{ inputs.url || 'https://www.kosbos.com/api/health' }}
+      LABEL: ${{ inputs.url && 'uptime-uji' || 'uptime-down' }}
+      NAMA: ${{ inputs.url && '[UJI] Monitor' || 'KosBos' }}
+      PEMILIK: farusfa-hub
+    steps:
+      - name: Cek dan beri tahu bila status berubah
+        run: |
+          set -euo pipefail
+          sekarang() { TZ=Asia/Jakarta date '+%-d %b %Y %H.%M WIB'; }
+
+          # Tiga percobaan supaya gangguan jaringan sesaat tidak menjadi alarm.
+          kode=000
+          for i in 1 2 3; do
+            kode=$(curl -sS -o respons.txt -m 20 -w '%{http_code}' -A kosbos-uptime "$TARGET" || true)
+            kode=${kode:-000}
+            echo "Percobaan $i: HTTP $kode"
+            if [ "$kode" = 200 ]; then break; fi
+            if [ "$i" -lt 3 ]; then sleep 30; fi
+          done
+
+          issue=$(gh issue list --label "$LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ "$kode" != 200 ]; then
+            if [ -n "$issue" ]; then
+              echo "Masih mati, alarm sudah ada di issue #$issue. Tidak ada alarm ulang."
+            else
+              {
+                echo "@$PEMILIK $NAMA tidak sehat sejak pemeriksaan $(sekarang)."
+                echo
+                echo "- URL: $TARGET"
+                echo "- HTTP: $kode"
+                echo
+                echo '```'
+                head -c 300 respons.txt 2>/dev/null || true
+                echo
+                echo '```'
+                echo
+                echo "HTTP 402 berarti Vercel memblokir akun, biasanya karena tagihan belum lunas. Langkah pemulihan ada di docs/khz/pemulihan-produksi.md pada repo produk."
+                echo
+                echo "Issue ini ditutup otomatis saat pulih. Selama masih mati tidak ada alarm ulang."
+              } > body.md
+              gh issue create --label "$LABEL" --title "$NAMA MATI: HTTP $kode ($(sekarang))" --body-file body.md
+            fi
+          elif [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "@$PEMILIK $NAMA sudah pulih pada pemeriksaan $(sekarang): $TARGET menjawab HTTP 200. Jalankan smoke test dan rekonsiliasi di docs/khz/pemulihan-produksi.md pada repo produk."
+            gh issue close "$issue"
+          else
+            echo "Sehat."
+          fi
+
+      # GitHub mematikan jadwal repo publik setelah 60 hari tanpa aktivitas; panggilan ini mencegahnya.
+      - name: Jaga jadwal tetap aktif
+        if: github.event_name == 'schedule'
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/uptime.yml/enable" || echo "::warning::Gagal memperbarui status jadwal"
