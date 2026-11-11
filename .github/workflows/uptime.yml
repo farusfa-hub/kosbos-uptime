@@ -1,8 +1,14 @@
 name: Uptime KosBos
+run-name: ${{ inputs.rantai == '1' && 'rantai' || inputs.url && 'uji' || github.event_name == 'schedule' && 'jaga' || 'manual' }}
 
 # Cek /api/health tiap 15 menit dari luar Vercel. Alarm hanya saat status berubah:
 # issue berlabel dibuka saat mati (mention pemilik) dan ditutup saat pulih.
 # Selama issue masih terbuka tidak ada alarm ulang.
+#
+# Pemicu 15 menit adalah RANTAI, bukan `schedule`: tiap run "rantai" mengecek, menunggu 15 menit
+# lewat wait timer environment `jeda-15-menit` (tanpa memakai runner), lalu memicu run berikutnya.
+# Jadwal GitHub di repo ini ternyata hanya terpicu tiap 5–8 jam (9–11 Nov 2026), jadi `schedule`
+# hanya dipakai sebagai penjaga: menyalakan rantai lagi bila rantainya putus.
 on:
   schedule:
     - cron: "7,22,37,52 * * * *"
@@ -12,20 +18,22 @@ on:
         description: "Kosongkan untuk cek produksi. Isi URL lain untuk uji notifikasi (status terpisah, label uptime-uji)."
         required: false
         default: ""
+      rantai:
+        description: "Isi 1 untuk menyalakan rantai 15 menit. Biasanya diisi otomatis; isi manual hanya bila rantai putus."
+        required: false
+        default: ""
 
 permissions: {}
-
-concurrency:
-  group: uptime-${{ inputs.url && 'uji' || 'produksi' }}
-  cancel-in-progress: false
 
 jobs:
   cek:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: uptime-cek-${{ inputs.url && 'uji' || 'produksi' }}
+      cancel-in-progress: false
     permissions:
       issues: write
-      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -79,7 +87,59 @@ jobs:
             echo "Sehat."
           fi
 
+  # Penjaga: hanya pada run terjadwal. Menyalakan rantai bila tidak ada run "rantai" yang masih hidup.
+  jaga:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
       # GitHub mematikan jadwal repo publik setelah 60 hari tanpa aktivitas; panggilan ini mencegahnya.
       - name: Jaga jadwal tetap aktif
-        if: github.event_name == 'schedule'
         run: gh api -X PUT "repos/$GH_REPO/actions/workflows/uptime.yml/enable" || echo "::warning::Gagal memperbarui status jadwal"
+      - name: Nyalakan rantai bila putus
+        run: |
+          set -euo pipefail
+          hidup=$(gh run list --workflow uptime.yml --event workflow_dispatch --limit 30 --json status,displayTitle \
+            --jq '[.[] | select(.displayTitle == "rantai" and .status != "completed")] | length')
+          if [ "$hidup" -gt 0 ]; then
+            echo "Rantai hidup ($hidup run)."
+          else
+            echo "::warning::Rantai putus, dinyalakan lagi."
+            gh workflow run uptime.yml -f rantai=1
+          fi
+
+  # Mata rantai: tunggu 15 menit (wait timer environment, tanpa runner), lalu picu run berikutnya.
+  lanjut:
+    needs: cek
+    if: always() && inputs.rantai == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: jeda-15-menit
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_INI: ${{ github.run_id }}
+    steps:
+      - name: Picu run berikutnya
+        run: |
+          set -euo pipefail
+          # Bila ada dua rantai (penjaga menyalakan saat rantai lama masih hidup), yang lebih tua berhenti.
+          lebih_baru=$(gh run list --workflow uptime.yml --event workflow_dispatch --limit 30 --json databaseId,status,displayTitle \
+            --jq "[.[] | select(.displayTitle == \"rantai\" and .status != \"completed\" and .databaseId > $RUN_INI)] | length")
+          if [ "$lebih_baru" -gt 0 ]; then
+            echo "Ada rantai yang lebih baru; rantai ini berhenti."
+            exit 0
+          fi
+          for i in 1 2 3; do
+            if gh workflow run uptime.yml -f rantai=1; then exit 0; fi
+            sleep 20
+          done
+          echo "::error::Gagal memicu run berikutnya; penjaga terjadwal akan menyalakan rantai lagi."
+          exit 1
